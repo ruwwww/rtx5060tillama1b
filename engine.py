@@ -83,13 +83,11 @@ class LlamaEngine:
         print(f"[engine] device = {self.device}")
         self.tokenizer    = AutoTokenizer.from_pretrained(model_cfg.hf_path)
         
-        # Llama 3/3.2 models use both <|end_of_text|> (128001) and <|eot_id|> (128009)
-        # to signal stops. Set up a set of stop IDs.
-        self.eos_token_ids = {self.tokenizer.eos_token_id}
-        eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        if isinstance(eot_id, int) and eot_id >= 0:
-            self.eos_token_ids.add(eot_id)
+        # Llama 3/3.2 models use <|end_of_text|> (128001), <|eom_id|> (128008), and <|eot_id|> (128009)
+        # to signal stops. Set up the complete set of stop IDs.
+        self.eos_token_ids = {self.tokenizer.eos_token_id, 128001, 128008, 128009}
         print(f"[engine] configured stop token IDs: {self.eos_token_ids}")
+
 
 
         self.attn_backend = FlashInferAttention(self.device)

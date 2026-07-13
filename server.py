@@ -303,8 +303,8 @@ def create_app(engine: LlamaEngine) -> FastAPI:
                     
                     <div class="setting-group">
                         <label for="temp">Temperature</label>
-                        <input type="range" id="temp" min="0" max="2.0" step="0.1" value="0.8">
-                        <div class="value-display"><span id="temp-val">0.8</span></div>
+                        <input type="range" id="temp" min="0" max="2.0" step="0.1" value="0.7">
+                        <div class="value-display"><span id="temp-val">0.7</span></div>
                     </div>
 
                     <div class="setting-group">
@@ -315,8 +315,8 @@ def create_app(engine: LlamaEngine) -> FastAPI:
 
                     <div class="setting-group">
                         <label for="max_tokens">Max Tokens</label>
-                        <input type="range" id="max_tokens" min="16" max="512" step="16" value="128">
-                        <div class="value-display"><span id="max_tokens-val">128</span></div>
+                        <input type="range" id="max_tokens" min="16" max="1024" step="16" value="512">
+                        <div class="value-display"><span id="max_tokens-val">512</span></div>
                     </div>
                 </div>
 
