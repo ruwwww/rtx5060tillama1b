@@ -18,7 +18,6 @@ Below is the generation throughput progression (measured on batch serving at bat
 - **Bucketed CUDA Graphs & `torch.compile`**: **~830 tokens/sec** (replays execution paths in batch-size buckets, reducing CPU launch overhead to ~10 microseconds).
 - **Zero-Allocation Decode**: Replaces dynamic runtime tensor allocations with pre-allocated GPU buffers.
 
-
 ## Setup
 
 Ensure your local conda environment is active and dependencies are met:
@@ -34,6 +33,3 @@ python -m rtx5060tillama1b.server --port 8000
 ```
 
 Once running, open **`http://localhost:8000`** in your web browser to start chatting with the model.
-
-
-
