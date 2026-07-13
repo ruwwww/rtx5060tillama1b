@@ -61,6 +61,55 @@ class AttentionBackend(ABC):
     ) -> torch.Tensor:                  # (B, num_heads, 1, head_dim)
         pass
 
+    def plan_decode(
+        self,
+        indptr:     torch.Tensor,       # (B+1,) int32
+        indices:    torch.Tensor,       # (total_blocks,) int32
+        last_page:  torch.Tensor,       # (B,) int32
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim:   int,
+        block_size: int,
+    ) -> None:
+        """
+        Pre-compute FlashInfer decode metadata before the layer loop.
+
+        Separating plan() from run() is required for CUDA Graph compatibility:
+        plan() runs on CPU (before graph capture); run() is inside the graph.
+
+        Default: no-op (SDPA backends don't need planning).
+        """
+        pass
+
+    def forward_decode_graph(
+        self,
+        q:           torch.Tensor,   # (B, num_heads, 1, head_dim)
+        k:           torch.Tensor,   # (B, num_kv_heads, 1, head_dim)
+        v:           torch.Tensor,   # (B, num_kv_heads, 1, head_dim)
+        layer_idx:   int,
+        kv_cache:    "KVCacheBackend",
+        blk_indices: torch.Tensor,   # (B,) int32 — pre-computed write positions
+        blk_offsets: torch.Tensor,   # (B,) int32
+        groups:      int,
+    ) -> torch.Tensor:
+        """
+        Graph-compatible decode attention.
+
+        Contract:
+          • plan_decode() was called before the graph region
+          • blk_indices / blk_offsets are pre-allocated stable tensors
+          • KV write uses write_kv_indexed (scatter op, no Python loops)
+          • Only decode_wrapper.run() is called (no plan())
+
+        Default: raises NotImplementedError — backends must override if they
+        want CUDA graph support.  LlamaEngine falls back to forward_decode_batch
+        if this raises.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support forward_decode_graph. "
+            "Falling back to buffered decode path."
+        )
+
 
 class PyTorchAttention(AttentionBackend):
     """
@@ -196,6 +245,33 @@ class FlashInferAttention(AttentionBackend):
         out = self.prefill_wrapper.run(q_fi, (k_pool, v_pool))
         return out.view(1, S, q.size(1), q.size(-1)).transpose(1, 2).contiguous()
 
+    def plan_decode(
+        self,
+        indptr:       torch.Tensor,   # (B+1,) int32
+        indices:      torch.Tensor,   # (total_blocks,) int32
+        last_page:    torch.Tensor,   # (B,) int32
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim:     int,
+        block_size:   int,
+    ) -> None:
+        """
+        Call FlashInfer decode_wrapper.plan() with pre-built buffer tensors.
+
+        Must be called once per decode step, before the layer loop.
+        Phase 4 will move this call to before CUDA graph replay.
+        """
+        self.decode_wrapper.plan(
+            indptr=indptr,
+            indices=indices,
+            last_page_len=last_page,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            page_size=block_size,
+            q_data_type=torch.bfloat16,
+        )
+
     def forward_decode_batch(
         self,
         q: torch.Tensor,
@@ -213,46 +289,76 @@ class FlashInferAttention(AttentionBackend):
         device = q.device
         block_size = kv_backend.block_size
 
-        # 1. Write each sequence's new single-token KV to 4D storage
-        for i in range(B):
-            kv_backend.write_one(
-                layer_idx, block_tables[i], positions[i],
-                k[i, :, 0, :],
-                v[i, :, 0, :],
+        if block_tables is not None:
+            # ── Self-contained path: build plan() args here ──────────────────
+            # Used by the original decode_batch() — no pre-allocated buffers.
+            for i in range(B):
+                kv_backend.write_one(
+                    layer_idx, block_tables[i], positions[i],
+                    k[i, :, 0, :],
+                    v[i, :, 0, :],
+                )
+            lengths = [len(tbl) for tbl in block_tables]
+            indptr_list = [0]
+            for l in lengths:
+                indptr_list.append(indptr_list[-1] + l)
+            indptr = torch.tensor(indptr_list, device=device, dtype=torch.int32)
+            flat_list = []
+            for tbl in block_tables:
+                flat_list.extend(tbl)
+            indices = torch.tensor(flat_list, device=device, dtype=torch.int32)
+            seq_lens_list = [pos + 1 for pos in positions]
+            last_page = torch.tensor(
+                [((sl - 1) % block_size) + 1 for sl in seq_lens_list],
+                device=device, dtype=torch.int32,
             )
+            self.decode_wrapper.plan(
+                indptr=indptr,
+                indices=indices,
+                last_page_len=last_page,
+                num_qo_heads=q.size(1),
+                num_kv_heads=k.size(1),
+                head_dim=q.size(-1),
+                page_size=block_size,
+                q_data_type=q.dtype,
+            )
+        # else: plan_decode() was already called by decode_batch_buffered.
+        # KV write also skipped here (Phase 4 will handle that).
 
-        # FlashInfer expects input q layout: [batch_size, num_heads, head_dim]
         q_fi = q.squeeze(2)
-
-        # Build decode metadata
-        lengths = [len(tbl) for tbl in block_tables]
-        indptr_list = [0]
-        for l in lengths:
-            indptr_list.append(indptr_list[-1] + l)
-        indptr = torch.tensor(indptr_list, device=device, dtype=torch.int32)
-
-        flat_indices_list = []
-        for tbl in block_tables:
-            flat_indices_list.extend(tbl)
-        indices = torch.tensor(flat_indices_list, device=device, dtype=torch.int32)
-
-        seq_lens = [pos + 1 for pos in positions]
-        last_page_len = torch.tensor([((slen - 1) % block_size) + 1 for slen in seq_lens], device=device, dtype=torch.int32)
-
-        self.decode_wrapper.plan(
-            indptr=indptr,
-            indices=indices,
-            last_page_len=last_page_len,
-            num_qo_heads=q.size(1),
-            num_kv_heads=k.size(1),
-            head_dim=q.size(-1),
-            page_size=block_size,
-            q_data_type=q.dtype,
-        )
-
         k_pool = kv_backend.k_pools[layer_idx]
         v_pool = kv_backend.v_pools[layer_idx]
-
         out = self.decode_wrapper.run(q_fi, (k_pool, v_pool))
         return out.unsqueeze(2)
+
+    def forward_decode_graph(
+        self,
+        q:           torch.Tensor,   # (B, num_heads, 1, head_dim)
+        k:           torch.Tensor,   # (B, num_kv_heads, 1, head_dim)
+        v:           torch.Tensor,   # (B, num_kv_heads, 1, head_dim)
+        layer_idx:   int,
+        kv_cache:    "KVCacheBackend",
+        blk_indices: torch.Tensor,   # (B,) int32 — write block per request
+        blk_offsets: torch.Tensor,   # (B,) int32 — write offset per request
+        groups:      int,
+    ) -> torch.Tensor:
+        """
+        CUDA-graph-compatible decode attention.
+
+        1. Scatter-write K/V using pre-computed tensor indices (no Python loops).
+        2. Call decode_wrapper.run() — plan_decode() was called BEFORE the graph.
+
+        Both operations are pure CUDA kernels and safe to capture.
+        """
+        # ── scatter-write new token KV ─────────────────────────────────────────
+        k_write = k[:, :, 0, :]   # (B, kv_heads, head_dim)
+        v_write = v[:, :, 0, :]
+        kv_cache.write_kv_indexed(layer_idx, blk_indices, blk_offsets, k_write, v_write)
+
+        # ── attention (plan already called outside graph) ──────────────────────
+        q_fi    = q.squeeze(2)    # (B, num_heads, head_dim)
+        k_pool  = kv_cache.k_pools[layer_idx]
+        v_pool  = kv_cache.v_pools[layer_idx]
+        out     = self.decode_wrapper.run(q_fi, (k_pool, v_pool))
+        return out.unsqueeze(2)   # (B, num_heads, 1, head_dim)
 

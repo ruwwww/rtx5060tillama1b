@@ -38,7 +38,14 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import AsyncIterator, Deque, List, Optional
 
+import torch
+
 from core.kv_cache import KVCacheBackend
+
+# Maximum blocks any single sequence can hold.
+# Kept as a module constant so Request doesn't need to import engine config.
+_MAX_BLOCKS_PER_SEQ: int = 256   # = max_seq_len(4096) / block_size(16)
+_DEVICE: str = "cuda"            # updated by engine at startup
 
 
 class RequestStatus(Enum):
@@ -61,6 +68,11 @@ class Request:
     status:        RequestStatus = field(default=RequestStatus.WAITING)
     output_tokens: List[int]     = field(default_factory=list)
     block_table:   List[int]     = field(default_factory=list)
+
+    # GPU tensor mirror of block_table — allocated once at admission, grown in-place.
+    # Shape: (_MAX_BLOCKS_PER_SEQ,), dtype=int32.  Valid entries: [:num_blocks].
+    # Allows buffer.copy_() with zero Python→tensor allocation overhead.
+    block_table_tensor: Optional[torch.Tensor] = field(default=None, repr=False)
 
     # ── streaming ────────────────────────────────────────────────────────────
     # Token IDs are pushed here; None is the end sentinel.
@@ -171,5 +183,13 @@ class Scheduler:
                 break     # not enough memory — stop admitting
             self.waiting.popleft()
             req.block_table = self.kv_backend.alloc(needed)
+            # Allocate the GPU tensor mirror once at admission time.
+            # Filled with -1 padding; valid block indices written into [:needed].
+            t = torch.full(
+                (_MAX_BLOCKS_PER_SEQ,), -1,
+                dtype=torch.int32, device=_DEVICE,
+            )
+            t[:needed] = torch.tensor(req.block_table, dtype=torch.int32)
+            req.block_table_tensor = t
             req.status = RequestStatus.PREFILL
             self.running.append(req)

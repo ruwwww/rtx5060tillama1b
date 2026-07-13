@@ -255,6 +255,27 @@ class GQA(nn.Module):
         )
         return self.o_proj(out.transpose(1, 2).contiguous().view(B, 1, -1))
 
+    def forward_decode_graph(
+        self,
+        x:           torch.Tensor,
+        cos:         torch.Tensor,
+        sin:         torch.Tensor,
+        kv_cache:    "KVCacheBackend",
+        blk_indices: torch.Tensor,
+        blk_offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        B, S, _ = x.shape
+        q, k, v = self._qkv(x, cos, sin)
+        out = self.attn_backend.forward_decode_graph(
+            q=q, k=k, v=v,
+            layer_idx=self.layer_idx,
+            kv_cache=kv_cache,
+            blk_indices=blk_indices,
+            blk_offsets=blk_offsets,
+            groups=self.groups,
+        )
+        return self.o_proj(out.transpose(1, 2).contiguous().view(B, S, -1))
+
 
 # ── SwiGLU FFN ───────────────────────────────────────────────────────────────
 
@@ -337,6 +358,20 @@ class TransformerLayer(nn.Module):
         """
         x = x + self.self_attn.forward_decode_batch(
             self.input_layernorm(x), cos, sin, kv_cache, block_tables, positions, flat_indices, metadata
+        )
+        return self._ffn(x)
+
+    def forward_decode_graph(
+        self,
+        x:           torch.Tensor,
+        cos:         torch.Tensor,
+        sin:         torch.Tensor,
+        kv_cache:    "KVCacheBackend",
+        blk_indices: torch.Tensor,
+        blk_offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        x = x + self.self_attn.forward_decode_graph(
+            self.input_layernorm(x), cos, sin, kv_cache, blk_indices, blk_offsets
         )
         return self._ffn(x)
 
@@ -481,3 +516,84 @@ class LlamaModel(nn.Module):
             )
 
         return self.lm_head(self.norm(h))[:, 0, :]
+
+    def decode_batch_buffered(
+        self,
+        ids_buf:     torch.Tensor,      # (B, 1) int64  — token IDs, pre-allocated
+        pos_buf:     torch.Tensor,      # (B, 1) int64  — position indices
+        kv_cache:    "KVCacheBackend",
+        indptr:      torch.Tensor,      # (B+1,) int32  — FlashInfer indptr
+        indices:     torch.Tensor,      # (total_blocks,) int32 — flat block indices
+        last_page:   torch.Tensor,      # (B,) int32    — last page fill count
+        seq_lens:    torch.Tensor,      # (B,) int32    — seq lengths (pos+1)
+        block_tables: List[List[int]],  # Python lists still used for KV write
+        positions:    List[int],        # integer positions for KV write
+    ) -> torch.Tensor:
+        """
+        Zero-allocation batched decode.
+
+        The 5 per-step tensor allocations (ids, pos, indptr, indices, last_page)
+        are replaced by in-place fills into pre-allocated GPU buffers.
+        block_tables/positions are still passed for the KV write step.
+
+        FlashInfer plan() is called once here before the layer loop.
+        Phase 4 will hoist plan() outside the CUDA graph boundary.
+
+        Returns logits : (B, vocab_size)
+        """
+        h        = self.embed_tokens(ids_buf)    # (B, 1, hidden)
+        cos, sin = self.rotary_emb(h, pos_buf)   # (B, 1, head_dim)
+
+        # Call plan() once before all 16 layers (Phase 4: move before graph.replay()).
+        self.attn_backend.plan_decode(
+            indptr, indices, last_page,
+            num_qo_heads=self.layers[0].self_attn.num_heads,
+            num_kv_heads=self.layers[0].self_attn.num_kv,
+            head_dim=self.layers[0].self_attn.head_dim,
+            block_size=kv_cache.block_size,
+        )
+
+        # Metadata stub — signals layers that plan() was already called externally.
+        metadata = FlashInferMetadata(
+            block_table=indices,
+            seq_lens=seq_lens,
+            block_size=kv_cache.block_size,
+        )
+
+        for layer in self.layers:
+            h = layer.forward_decode_batch(
+                h, cos, sin, kv_cache,
+                block_tables=block_tables,  # still needed for KV write
+                positions=positions,
+                flat_indices=None,
+                metadata=metadata,
+            )
+
+        return self.lm_head(self.norm(h))[:, 0, :]
+
+
+    def decode_batch_graph(
+        self,
+        ids_buf:     torch.Tensor,     # (B, 1) int64
+        pos_buf:     torch.Tensor,     # (B, 1) int64
+        kv_cache:    "KVCacheBackend",
+        blk_indices: torch.Tensor,     # (B,) int32
+        blk_offsets: torch.Tensor,     # (B,) int32
+    ) -> torch.Tensor:
+        """
+        CUDA-graph-capturable decode batch execution.
+
+        Contains only pure PyTorch tensor operations and GPU kernel launches.
+        FlashInfer.plan() is NOT called inside this method.
+        All inputs are pre-allocated tensors with stable addresses.
+        """
+        h        = self.embed_tokens(ids_buf)    # (B, 1, hidden)
+        cos, sin = self.rotary_emb(h, pos_buf)   # (B, 1, head_dim)
+
+        for layer in self.layers:
+            h = layer.forward_decode_graph(
+                h, cos, sin, kv_cache, blk_indices, blk_offsets
+            )
+
+        return self.lm_head(self.norm(h))[:, 0, :]
+
