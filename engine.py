@@ -45,6 +45,7 @@ from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
 from config import EngineConfig, ModelConfig
+from core.attention import FlashInferAttention
 from core.kv_cache import KVCacheBackend, PagedKVBackend
 from core.llama import LlamaModel
 from core.scheduler import Request, RequestStatus, Scheduler
@@ -79,6 +80,7 @@ class LlamaEngine:
         self.tokenizer    = AutoTokenizer.from_pretrained(model_cfg.hf_path)
         self.eos_token_id = self.tokenizer.eos_token_id
 
+        self.attn_backend = FlashInferAttention(self.device)
         self.model    = self._load_model()
         self.kv_cache = self._init_kv_cache()
         self.scheduler = Scheduler(self.kv_cache, max_running=engine_cfg.max_batch_size)
@@ -99,7 +101,7 @@ class LlamaEngine:
         state = load_file(path, device="cpu")
         state = {k: v.to(torch.bfloat16) for k, v in state.items()}
 
-        model = LlamaModel(self.model_cfg).to(dtype=torch.bfloat16)
+        model = LlamaModel(self.model_cfg, attn_backend=self.attn_backend).to(dtype=torch.bfloat16)
         model.load_hf_weights(state)
         del state
         model.to(self.device)
