@@ -195,3 +195,52 @@ class KVCachePool:
         k = self.k_pools[layer_idx][idx]                 # (seq_len, kv_heads, head_dim)
         v = self.v_pools[layer_idx][idx]
         return k.permute(1, 0, 2).contiguous(), v.permute(1, 0, 2).contiguous()
+
+    def gather_kv_batch(
+        self,
+        layer_idx: int,
+        block_tables: List[List[int]],
+        seq_lens: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Gather KV for a BATCH of sequences, padded to max(seq_lens).
+
+        Used by batched decode: all sequences in the active decode batch
+        are gathered in one call so the attention GEMM can run as a single
+        (B, heads, max_len, head_dim) operation.
+
+        Returns
+        ───────
+        k_padded : (B, num_kv_heads, max_len, head_dim)
+        v_padded : (B, num_kv_heads, max_len, head_dim)
+        mask     : (B, 1, 1, max_len) — 0.0 for valid, -inf for padding
+                   additive mask compatible with F.scaled_dot_product_attention
+
+        Memory overhead: B × max_len × kv_heads × head_dim × 2 bytes
+        For B=4, max_len=2048: 4×2048×8×64×2 = 8 MiB — trivial.
+
+        Future (FlashInfer): replace with BatchDecodeWithPagedKVCacheWrapper
+        which operates on the paged pool directly — no gather copy needed.
+        """
+        B       = len(seq_lens)
+        max_len = max(seq_lens)
+
+        k_out = torch.zeros(
+            B, self.num_kv_heads, max_len, self.head_dim,
+            device=self.device, dtype=self.dtype,
+        )
+        v_out  = torch.zeros_like(k_out)
+        # Additive mask: 0 = attend, -inf = ignore
+        mask = torch.full(
+            (B, 1, 1, max_len), float("-inf"),
+            device=self.device, dtype=torch.float32,
+        )
+
+        for i, (table, slen) in enumerate(zip(block_tables, seq_lens)):
+            k_i, v_i = self.gather_kv(layer_idx, table, slen)  # (kv_heads, slen, head_dim)
+            k_out[i, :, :slen, :] = k_i
+            v_out[i, :, :slen, :] = v_i
+            mask[i, 0, 0, :slen] = 0.0
+
+        return k_out, v_out, mask
+

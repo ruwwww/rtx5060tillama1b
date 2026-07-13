@@ -76,12 +76,20 @@ class Request:
         return self._num_prompt_tokens
 
     @property
-    def decode_position(self) -> int:
+    def num_kv_entries(self) -> int:
         """
-        The token position that the NEXT decode step will write to KV cache.
-        = number of tokens already written = prompt + previously generated tokens.
+        Number of token KV pairs currently written in the cache.
+
+        During decode, output_tokens[-1] is the *current input* token
+        that will be written this step — it is NOT in the cache yet.
+        So entries = prompt_tokens + (output_tokens generated so far - 1).
+
+        Timeline:
+          after prefill : output=[t0]        → num_kv_entries = P
+          after step 1  : output=[t0,t1]     → num_kv_entries = P+1
+          after step 2  : output=[t0,t1,t2]  → num_kv_entries = P+2
         """
-        return self._num_prompt_tokens + len(self.output_tokens)
+        return self._num_prompt_tokens + max(0, len(self.output_tokens) - 1)
 
     # ── output helpers ──────────────────────────────────────────────────────
 
