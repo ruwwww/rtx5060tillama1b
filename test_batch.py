@@ -48,7 +48,7 @@ async def main() -> None:
     # Submit all requests at once — scheduler will batch decode steps
     tasks = [
         asyncio.create_task(
-            collect(f"Q{i}", engine.generate(p, max_new_tokens=32))
+            collect(f"Q{i}", engine.generate(p, max_new_tokens=32, temperature=0.0))
         )
         for i, p in enumerate(PROMPTS)
     ]

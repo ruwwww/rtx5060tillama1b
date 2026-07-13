@@ -82,7 +82,15 @@ class LlamaEngine:
 
         print(f"[engine] device = {self.device}")
         self.tokenizer    = AutoTokenizer.from_pretrained(model_cfg.hf_path)
-        self.eos_token_id = self.tokenizer.eos_token_id
+        
+        # Llama 3/3.2 models use both <|end_of_text|> (128001) and <|eot_id|> (128009)
+        # to signal stops. Set up a set of stop IDs.
+        self.eos_token_ids = {self.tokenizer.eos_token_id}
+        eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        if isinstance(eot_id, int) and eot_id >= 0:
+            self.eos_token_ids.add(eot_id)
+        print(f"[engine] configured stop token IDs: {self.eos_token_ids}")
+
 
         self.attn_backend = FlashInferAttention(self.device)
         self.model    = self._load_model()
@@ -276,7 +284,8 @@ class LlamaEngine:
         return int(torch.multinomial(logits.softmax(dim=-1), 1).item())
 
     def _is_done(self, req: Request, token_id: int) -> bool:
-        return token_id == self.eos_token_id or len(req.output_tokens) >= req.max_new_tokens
+        return token_id in self.eos_token_ids or len(req.output_tokens) >= req.max_new_tokens
+
 
     # ── one engine step ───────────────────────────────────────────────────────
 
@@ -543,6 +552,10 @@ class LlamaEngine:
             await self.start()
 
         async for token_id in req.stream():
+            # Skip yielding special stop tokens as raw text (e.g. <|eot_id|>)
+            if token_id in self.eos_token_ids:
+                continue
             yield GenerationOutput(self.tokenizer.decode([token_id]), finished=False)
 
         yield GenerationOutput("", finished=True)
+
