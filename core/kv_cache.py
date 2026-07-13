@@ -310,3 +310,153 @@ class ContiguousKVBackend(KVCacheBackend):
             self.pool._flat_indices(block_tables[i], positions[i] + 1)
             for i in range(len(positions))
         ]
+
+
+class PagedKVBackend(KVCacheBackend):
+    """
+    True paged layout KV cache storage backend.
+    
+    Stores key/value pools as 4D tensors:
+      (num_blocks, block_size, num_kv_heads, head_dim)
+    
+    This matches the exact physical layout that FlashInfer expects, but
+    materialises contiguous views for standard SDPA during execution to 
+    allow validating correctness.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_blocks: int,
+        num_kv_heads: int,
+        block_size: int,
+        head_dim: int,
+        device: str,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        self.num_layers = num_layers
+        self.num_blocks = num_blocks
+        self.num_kv_heads = num_kv_heads
+        self.block_size = block_size
+        self.head_dim = head_dim
+        self.device = device
+        self.dtype = dtype
+
+        self.allocator = BlockAllocator(num_blocks, block_size)
+
+        # 4D flat storage pools per layer: (num_blocks, block_size, num_kv_heads, head_dim)
+        pool_shape = (num_blocks, block_size, num_kv_heads, head_dim)
+        self.k_pools = [
+            torch.zeros(pool_shape, device=device, dtype=dtype)
+            for _ in range(num_layers)
+        ]
+        self.v_pools = [
+            torch.zeros(pool_shape, device=device, dtype=dtype)
+            for _ in range(num_layers)
+        ]
+
+    def blocks_needed(self, num_tokens: int) -> int:
+        return self.allocator.blocks_needed(num_tokens)
+
+    @property
+    def num_free_blocks(self) -> int:
+        return self.allocator.num_free
+
+    def alloc(self, n: int) -> List[int]:
+        return self.allocator.alloc(n)
+
+    def free(self, block_table: List[int]) -> None:
+        self.allocator.free(block_table)
+
+    def _flat_indices(self, block_table: List[int], seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.arange(seq_len, device=self.device, dtype=torch.long)
+        logical_blocks = positions // self.block_size
+        offsets = positions % self.block_size
+        physical_blocks = torch.tensor(
+            [block_table[i] for i in logical_blocks.tolist()],
+            device=self.device, dtype=torch.long,
+        )
+        return physical_blocks, offsets
+
+    def write_one(
+        self,
+        layer_idx: int,
+        block_table: List[int],
+        position: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        block_idx = block_table[position // self.block_size]
+        offset = position % self.block_size
+        self.k_pools[layer_idx][block_idx, offset] = k
+        self.v_pools[layer_idx][block_idx, offset] = v
+
+    def write_many(
+        self,
+        layer_idx: int,
+        block_table: List[int],
+        k: torch.Tensor,
+        v: torch.Tensor,
+        start_pos: int = 0,
+    ) -> None:
+        seq_len = k.size(0)
+        if seq_len == 0:
+            return
+        blocks, offsets = self._flat_indices(block_table, seq_len)
+        self.k_pools[layer_idx][blocks, offsets] = k
+        self.v_pools[layer_idx][blocks, offsets] = v
+
+    def gather_kv(
+        self,
+        layer_idx: int,
+        block_table: List[int],
+        seq_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        blocks, offsets = self._flat_indices(block_table, seq_len)
+        k = self.k_pools[layer_idx][blocks, offsets]
+        v = self.v_pools[layer_idx][blocks, offsets]
+        return k.permute(1, 0, 2).contiguous(), v.permute(1, 0, 2).contiguous()
+
+    def gather_kv_batch(
+        self,
+        layer_idx: int,
+        block_tables: List[List[int]],
+        seq_lens: List[int],
+        flat_indices: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B = len(seq_lens)
+        max_len = max(seq_lens)
+
+        k_out = torch.zeros(
+            B, self.num_kv_heads, max_len, self.head_dim,
+            device=self.device, dtype=self.dtype,
+        )
+        v_out = torch.zeros_like(k_out)
+        mask = torch.full(
+            (B, 1, 1, max_len), float("-inf"),
+            device=self.device, dtype=torch.float32,
+        )
+
+        for i, slen in enumerate(seq_lens):
+            if flat_indices is not None:
+                blocks, offsets = flat_indices[i]
+            else:
+                blocks, offsets = self._flat_indices(block_tables[i], slen)
+            k = self.k_pools[layer_idx][blocks, offsets]
+            v = self.v_pools[layer_idx][blocks, offsets]
+            k_out[i, :, :slen, :] = k.permute(1, 0, 2)
+            v_out[i, :, :slen, :] = v.permute(1, 0, 2)
+            mask[i, 0, 0, :slen] = 0.0
+
+        return k_out, v_out, mask
+
+    def precompute_decode_indices(
+        self,
+        block_tables: List[List[int]],
+        positions: List[int],
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        return [
+            self._flat_indices(block_tables[i], positions[i] + 1)
+            for i in range(len(positions))
+        ]
+

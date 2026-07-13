@@ -45,7 +45,7 @@ from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
 from config import EngineConfig, ModelConfig
-from core.kv_cache import KVCacheBackend, ContiguousKVBackend
+from core.kv_cache import KVCacheBackend, PagedKVBackend
 from core.llama import LlamaModel
 from core.scheduler import Request, RequestStatus, Scheduler
 
@@ -112,7 +112,7 @@ class LlamaEngine:
         total_tokens = self.engine_cfg.max_batch_size * self.engine_cfg.max_seq_len
         num_blocks   = total_tokens // self.BLOCK_SIZE + 32   # +32 headroom
 
-        backend = ContiguousKVBackend(
+        backend = PagedKVBackend(
             num_layers  = self.model_cfg.num_hidden_layers,
             num_blocks  = num_blocks,
             num_kv_heads= self.model_cfg.num_key_value_heads,
