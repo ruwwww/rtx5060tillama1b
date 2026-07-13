@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import AsyncIterator, Deque, List, Optional
 
-from core.kv_cache import BlockAllocator
+from core.kv_cache import KVCacheBackend
 
 
 class RequestStatus(Enum):
@@ -121,10 +121,10 @@ class Scheduler:
 
     def __init__(
         self,
-        allocator: BlockAllocator,
+        kv_backend: KVCacheBackend,
         max_running: int = 4,
     ) -> None:
-        self.allocator   = allocator
+        self.kv_backend  = kv_backend
         self.max_running = max_running
 
         self.waiting: Deque[Request] = deque()
@@ -149,7 +149,7 @@ class Scheduler:
 
     def finish(self, req: Request) -> None:
         req.mark_done()
-        self.allocator.free(req.block_table)
+        self.kv_backend.free(req.block_table)
         if req in self.running:
             self.running.remove(req)
 
@@ -161,15 +161,15 @@ class Scheduler:
 
     def _blocks_for(self, req: Request) -> int:
         total = req.num_prompt_tokens + req.max_new_tokens
-        return self.allocator.blocks_needed(total)
+        return self.kv_backend.blocks_needed(total)
 
     def _admit_waiting(self) -> None:
         while self.waiting and len(self.running) < self.max_running:
             req = self.waiting[0]
             needed = self._blocks_for(req)
-            if self.allocator.num_free < needed:
+            if self.kv_backend.num_free_blocks < needed:
                 break     # not enough memory — stop admitting
             self.waiting.popleft()
-            req.block_table = self.allocator.alloc(needed)
+            req.block_table = self.kv_backend.alloc(needed)
             req.status = RequestStatus.PREFILL
             self.running.append(req)

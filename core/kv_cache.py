@@ -1,52 +1,103 @@
 """
-KV Cache with paged memory management.
+KV Cache Storage Abstraction.
 
-Memory layout
-─────────────
-k_pools[layer] : (num_blocks * block_size, num_kv_heads, head_dim)  ← flat view
-                 stored as bfloat16, contiguous, pre-zeroed
-
-Block table
-───────────
-Each request owns a list of physical block indices (integers).
-Logical position p maps to:
-  physical_block = block_table[p // block_size]
-  block_offset   = p  % block_size
-  flat_index     = physical_block * block_size + block_offset
-
-Future extensibility
-────────────────────
-• Radix Attention / Prefix Caching
-    BlockAllocator becomes ref-counted; blocks whose content hash matches
-    a cached prefix are reused across requests (zero-copy sharing).
-• FlashInfer backend
-    Replace gather_kv() + SDPA with flashinfer.single_decode_with_kv_cache()
-    or flashinfer.BatchPrefillWithPagedKVCacheWrapper — these kernels operate
-    directly on the (num_blocks, num_kv_heads, block_size, head_dim) paged
-    layout without materialising a gathered tensor.
+Defines KVCacheBackend and the ContiguousKVBackend implementation.
 """
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from abc import ABC, abstractmethod
+from typing import List, Tuple, Optional
 
 import torch
 
 
+class KVCacheBackend(ABC):
+    """
+    Abstract storage backend for KV cache memory management and reading/writing.
+    """
+
+    @abstractmethod
+    def blocks_needed(self, num_tokens: int) -> int:
+        """Calculate how many blocks are required for the given number of tokens."""
+        pass
+
+    @property
+    @abstractmethod
+    def num_free_blocks(self) -> int:
+        """Number of free blocks remaining in the allocator."""
+        pass
+
+    @abstractmethod
+    def alloc(self, n: int) -> List[int]:
+        """Allocate n blocks and return their physical indices."""
+        pass
+
+    @abstractmethod
+    def free(self, block_table: List[int]) -> None:
+        """Free a list of blocks back to the allocator."""
+        pass
+
+    @abstractmethod
+    def write_one(
+        self,
+        layer_idx: int,
+        block_table: List[int],
+        position: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        """Write a single token's KV projection at the given position."""
+        pass
+
+    @abstractmethod
+    def write_many(
+        self,
+        layer_idx: int,
+        block_table: List[int],
+        k: torch.Tensor,
+        v: torch.Tensor,
+        start_pos: int = 0,
+    ) -> None:
+        """Vectorized scatter-write for multiple prefill tokens at once."""
+        pass
+
+    @abstractmethod
+    def gather_kv(
+        self,
+        layer_idx: int,
+        block_table: List[int],
+        seq_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather KV for a single sequence from the storage backend."""
+        pass
+
+    @abstractmethod
+    def gather_kv_batch(
+        self,
+        layer_idx: int,
+        block_tables: List[List[int]],
+        seq_lens: List[int],
+        flat_indices: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather KV for a batch of sequences, padded to max(seq_lens) with an attention mask."""
+        pass
+
+    @abstractmethod
+    def precompute_decode_indices(
+        self,
+        block_tables: List[List[int]],
+        positions: List[int],
+    ) -> List[torch.Tensor]:
+        """Precompute flat lookup indices for decoding requests once per step."""
+        pass
+
+
 class BlockAllocator:
-    """
-    Simple free-list allocator.
-
-    Future: add ref-counting for prefix-cache block sharing.
-    A block with ref_count > 1 must be copy-on-write before mutation.
-    """
-
     def __init__(self, num_blocks: int, block_size: int) -> None:
         self.num_blocks = num_blocks
         self.block_size = block_size
         self._free: List[int] = list(range(num_blocks))
-
-    # ── allocation ──────────────────────────────────────────────────────────
 
     def alloc(self, n: int) -> List[int]:
         if len(self._free) < n:
@@ -59,8 +110,6 @@ class BlockAllocator:
     def free(self, blocks: List[int]) -> None:
         self._free.extend(blocks)
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-
     @property
     def num_free(self) -> int:
         return len(self._free)
@@ -70,17 +119,6 @@ class BlockAllocator:
 
 
 class KVCachePool:
-    """
-    Pre-allocated KV cache for all layers.
-
-    Internal storage is a flat 1-D token layout so scatter/gather reduce
-    to simple advanced-index ops on contiguous tensors — no reshape copies.
-
-    Shape per layer:
-        k_pools[l] : (total_slots, num_kv_heads, head_dim)
-        where total_slots = num_blocks * block_size
-    """
-
     def __init__(
         self,
         num_layers: int,
@@ -110,61 +148,31 @@ class KVCachePool:
             for _ in range(num_layers)
         ]
 
-    # ── private helpers ──────────────────────────────────────────────────────
-
     def _flat_indices(
         self,
         block_table: List[int],
         seq_len: int,
         start_pos: int = 0,
     ) -> torch.Tensor:
-        """
-        Return flat pool indices for positions [start_pos, start_pos+seq_len).
-        Shape: (seq_len,)
-        """
         positions = torch.arange(
             start_pos, start_pos + seq_len, device=self.device, dtype=torch.long
         )
-        logical_blocks = positions // self.block_size        # which block in table
-        block_offsets  = positions  % self.block_size        # offset within block
-
-        # Map logical → physical blocks (CPU list → CUDA tensor)
+        logical_blocks = positions // self.block_size
+        block_offsets  = positions  % self.block_size
         physical = torch.tensor(
             [block_table[i] for i in logical_blocks.tolist()],
             device=self.device, dtype=torch.long,
         )
-        return physical * self.block_size + block_offsets    # flat slot index
-
-    def precompute_decode_indices(
-        self,
-        block_tables: List[List[int]],
-        positions: List[int],
-    ) -> List[torch.Tensor]:
-        """
-        Pre-compute flat gather indices for a decode batch.
-
-        Called ONCE per decode step — the same indices are reused for all
-        16 transformer layers, reducing _flat_indices calls from B×16 to B.
-
-        positions[i] = num_kv_entries for request i (tokens already in cache).
-        After writing, sequence i has positions[i]+1 entries.
-        """
-        return [
-            self._flat_indices(block_tables[i], positions[i] + 1)
-            for i in range(len(positions))
-        ]
-
-    # ── write ────────────────────────────────────────────────────────────────
+        return physical * self.block_size + block_offsets
 
     def write_one(
         self,
         layer_idx: int,
         block_table: List[int],
-        position: int,          # absolute token position
-        k: torch.Tensor,        # (num_kv_heads, head_dim)
+        position: int,
+        k: torch.Tensor,
         v: torch.Tensor,
     ) -> None:
-        """Write a single token's KV at the given position."""
         slot = block_table[position // self.block_size] * self.block_size \
                + position % self.block_size
         self.k_pools[layer_idx][slot] = k
@@ -174,24 +182,16 @@ class KVCachePool:
         self,
         layer_idx: int,
         block_table: List[int],
-        k: torch.Tensor,        # (seq_len, num_kv_heads, head_dim)
+        k: torch.Tensor,
         v: torch.Tensor,
         start_pos: int = 0,
     ) -> None:
-        """
-        Vectorised scatter-write for prefill (multiple tokens at once).
-
-        Future (FlashInfer): this whole call is replaced by a fused
-        prefill kernel that writes the paged KV while computing attention.
-        """
         seq_len = k.size(0)
         if seq_len == 0:
             return
-        idx = self._flat_indices(block_table, seq_len, start_pos)   # (seq_len,)
+        idx = self._flat_indices(block_table, seq_len, start_pos)
         self.k_pools[layer_idx][idx] = k
         self.v_pools[layer_idx][idx] = v
-
-    # ── gather ───────────────────────────────────────────────────────────────
 
     def gather_kv(
         self,
@@ -199,21 +199,73 @@ class KVCachePool:
         block_table: List[int],
         seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Gather KV for a single sequence from the paged pool.
-
-        Returns
-        ───────
-        k : (num_kv_heads, seq_len, head_dim)
-        v : (num_kv_heads, seq_len, head_dim)
-
-        Future (FlashInfer): replace with a kernel that reads directly from
-        the paged layout — no gather materialisation, lower memory bandwidth.
-        """
-        idx = self._flat_indices(block_table, seq_len)   # (seq_len,)
-        k = self.k_pools[layer_idx][idx]                 # (seq_len, kv_heads, head_dim)
+        idx = self._flat_indices(block_table, seq_len)
+        k = self.k_pools[layer_idx][idx]
         v = self.v_pools[layer_idx][idx]
         return k.permute(1, 0, 2).contiguous(), v.permute(1, 0, 2).contiguous()
+
+
+class ContiguousKVBackend(KVCacheBackend):
+    """
+    Standard implementation wrapping KVCachePool and BlockAllocator.
+    Keeps the exact contiguous gathering behaviour as the original codebase.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_blocks: int,
+        num_kv_heads: int,
+        block_size: int,
+        head_dim: int,
+        device: str,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        self.allocator = BlockAllocator(num_blocks, block_size)
+        self.pool = KVCachePool(
+            num_layers, num_blocks, num_kv_heads, block_size, head_dim, device, dtype
+        )
+
+    def blocks_needed(self, num_tokens: int) -> int:
+        return self.allocator.blocks_needed(num_tokens)
+
+    @property
+    def num_free_blocks(self) -> int:
+        return self.allocator.num_free
+
+    def alloc(self, n: int) -> List[int]:
+        return self.allocator.alloc(n)
+
+    def free(self, block_table: List[int]) -> None:
+        self.allocator.free(block_table)
+
+    def write_one(
+        self,
+        layer_idx: int,
+        block_table: List[int],
+        position: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        self.pool.write_one(layer_idx, block_table, position, k, v)
+
+    def write_many(
+        self,
+        layer_idx: int,
+        block_table: List[int],
+        k: torch.Tensor,
+        v: torch.Tensor,
+        start_pos: int = 0,
+    ) -> None:
+        self.pool.write_many(layer_idx, block_table, k, v, start_pos)
+
+    def gather_kv(
+        self,
+        layer_idx: int,
+        block_table: List[int],
+        seq_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.pool.gather_kv(layer_idx, block_table, seq_len)
 
     def gather_kv_batch(
         self,
@@ -222,48 +274,39 @@ class KVCachePool:
         seq_lens: List[int],
         flat_indices: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Gather KV for a BATCH of sequences, padded to max(seq_lens).
-
-        flat_indices : pre-computed per-sequence flat pool indices
-            (from precompute_decode_indices). When provided, the O(seq_len)
-            _flat_indices computation is skipped — each layer reuses the same
-            indices since positions do not change within a step.
-            This reduces Python overhead from B×16 to B calls per step.
-
-        Returns
-        ───────
-        k_padded : (B, num_kv_heads, max_len, head_dim)
-        v_padded : (B, num_kv_heads, max_len, head_dim)
-        mask     : (B, 1, 1, max_len) — 0.0 for valid, -inf for padding
-
-        Future (FlashInfer): replace with BatchDecodeWithPagedKVCacheWrapper
-        which operates on the paged pool directly — no gather copy needed.
-        """
         B       = len(seq_lens)
         max_len = max(seq_lens)
 
         k_out = torch.zeros(
-            B, self.num_kv_heads, max_len, self.head_dim,
-            device=self.device, dtype=self.dtype,
+            B, self.pool.num_kv_heads, max_len, self.pool.head_dim,
+            device=self.pool.device, dtype=self.pool.dtype,
         )
         v_out  = torch.zeros_like(k_out)
         mask = torch.full(
             (B, 1, 1, max_len), float("-inf"),
-            device=self.device, dtype=torch.float32,
+            device=self.pool.device, dtype=torch.float32,
         )
 
         for i, slen in enumerate(seq_lens):
             idx = (
                 flat_indices[i]
                 if flat_indices is not None
-                else self._flat_indices(block_tables[i], slen)
+                else self.pool._flat_indices(block_tables[i], slen)
             )
-            k = self.k_pools[layer_idx][idx]   # (slen, kv_heads, head_dim)
-            v = self.v_pools[layer_idx][idx]
+            k = self.pool.k_pools[layer_idx][idx]
+            v = self.pool.v_pools[layer_idx][idx]
             k_out[i, :, :slen, :] = k.permute(1, 0, 2)
             v_out[i, :, :slen, :] = v.permute(1, 0, 2)
             mask[i, 0, 0, :slen] = 0.0
 
         return k_out, v_out, mask
 
+    def precompute_decode_indices(
+        self,
+        block_tables: List[List[int]],
+        positions: List[int],
+    ) -> List[torch.Tensor]:
+        return [
+            self.pool._flat_indices(block_tables[i], positions[i] + 1)
+            for i in range(len(positions))
+        ]

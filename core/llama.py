@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from config import ModelConfig
 
 if TYPE_CHECKING:
-    from core.kv_cache import KVCachePool
+    from core.kv_cache import KVCacheBackend
 
 
 # ── RMS Norm ─────────────────────────────────────────────────────────────────
@@ -174,7 +174,7 @@ class GQA(nn.Module):
         x: torch.Tensor,            # (1, seq_len, hidden)
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: "KVCachePool",
+        kv_cache: "KVCacheBackend",
         block_table: List[int],
     ) -> torch.Tensor:
         """
@@ -206,7 +206,7 @@ class GQA(nn.Module):
         x: torch.Tensor,            # (1, 1, hidden)
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: "KVCachePool",
+        kv_cache: "KVCacheBackend",
         block_table: List[int],
         position: int,              # absolute position of this new token
     ) -> torch.Tensor:
@@ -249,7 +249,7 @@ class GQA(nn.Module):
         x: torch.Tensor,              # (B, 1, hidden)
         cos: torch.Tensor,            # (B, 1, head_dim) — per-seq positions
         sin: torch.Tensor,
-        kv_cache: "KVCachePool",
+        kv_cache: "KVCacheBackend",
         block_tables: List[List[int]],
         positions: List[int],         # num_kv_entries for each seq
         flat_indices: Optional[List["torch.Tensor"]] = None,  # pre-computed
@@ -328,7 +328,7 @@ class TransformerLayer(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: "KVCachePool",
+        kv_cache: "KVCacheBackend",
         block_table: List[int],
     ) -> torch.Tensor:
         x = x + self.self_attn.forward_prefill(self.input_layernorm(x), cos, sin, kv_cache, block_table)
@@ -339,7 +339,7 @@ class TransformerLayer(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: "KVCachePool",
+        kv_cache: "KVCacheBackend",
         block_table: List[int],
         position: int,
     ) -> torch.Tensor:
@@ -351,7 +351,7 @@ class TransformerLayer(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: "KVCachePool",
+        kv_cache: "KVCacheBackend",
         block_tables: List[List[int]],
         positions: List[int],
         flat_indices: Optional[List["torch.Tensor"]] = None,
@@ -412,7 +412,7 @@ class LlamaModel(nn.Module):
     def prefill(
         self,
         tokens: List[int],
-        kv_cache: "KVCachePool",
+        kv_cache: "KVCacheBackend",
         block_table: List[int],
     ) -> torch.Tensor:
         """
@@ -436,7 +436,7 @@ class LlamaModel(nn.Module):
     def decode_one(
         self,
         token: int,
-        kv_cache: "KVCachePool",
+        kv_cache: "KVCacheBackend",
         block_table: List[int],
         position: int,
     ) -> torch.Tensor:
@@ -460,7 +460,7 @@ class LlamaModel(nn.Module):
     def decode_batch(
         self,
         tokens: List[int],
-        kv_cache: "KVCachePool",
+        kv_cache: "KVCacheBackend",
         block_tables: List[List[int]],
         positions: List[int],
     ) -> torch.Tensor:

@@ -45,7 +45,7 @@ from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
 from config import EngineConfig, ModelConfig
-from core.kv_cache import BlockAllocator, KVCachePool
+from core.kv_cache import KVCacheBackend, ContiguousKVBackend
 from core.llama import LlamaModel
 from core.scheduler import Request, RequestStatus, Scheduler
 
@@ -80,8 +80,8 @@ class LlamaEngine:
         self.eos_token_id = self.tokenizer.eos_token_id
 
         self.model    = self._load_model()
-        self.kv_cache, self.allocator = self._init_kv_cache()
-        self.scheduler = Scheduler(self.allocator, max_running=engine_cfg.max_batch_size)
+        self.kv_cache = self._init_kv_cache()
+        self.scheduler = Scheduler(self.kv_cache, max_running=engine_cfg.max_batch_size)
 
         # Dedicated inference thread — keeps PyTorch compute off the event loop
         # so the event loop can concurrently handle streaming consumers and
@@ -107,13 +107,12 @@ class LlamaEngine:
         print("[engine] model ready")
         return model
 
-    def _init_kv_cache(self) -> tuple[KVCachePool, BlockAllocator]:
+    def _init_kv_cache(self) -> KVCacheBackend:
         # Pre-allocate enough blocks for max_batch * max_seq_len tokens
         total_tokens = self.engine_cfg.max_batch_size * self.engine_cfg.max_seq_len
         num_blocks   = total_tokens // self.BLOCK_SIZE + 32   # +32 headroom
 
-        allocator = BlockAllocator(num_blocks, self.BLOCK_SIZE)
-        pool = KVCachePool(
+        backend = ContiguousKVBackend(
             num_layers  = self.model_cfg.num_hidden_layers,
             num_blocks  = num_blocks,
             num_kv_heads= self.model_cfg.num_key_value_heads,
@@ -130,7 +129,7 @@ class LlamaEngine:
             * self.model_cfg.head_dim * 2  # bfloat16
         ) / 1024**3
         print(f"[engine] KV cache  : {num_blocks} blocks × {self.BLOCK_SIZE} tokens = {total_tokens} slots  ({kv_gb:.2f} GiB)")
-        return pool, allocator
+        return backend
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
