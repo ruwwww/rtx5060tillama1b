@@ -135,6 +135,25 @@ class KVCachePool:
         )
         return physical * self.block_size + block_offsets    # flat slot index
 
+    def precompute_decode_indices(
+        self,
+        block_tables: List[List[int]],
+        positions: List[int],
+    ) -> List[torch.Tensor]:
+        """
+        Pre-compute flat gather indices for a decode batch.
+
+        Called ONCE per decode step — the same indices are reused for all
+        16 transformer layers, reducing _flat_indices calls from B×16 to B.
+
+        positions[i] = num_kv_entries for request i (tokens already in cache).
+        After writing, sequence i has positions[i]+1 entries.
+        """
+        return [
+            self._flat_indices(block_tables[i], positions[i] + 1)
+            for i in range(len(positions))
+        ]
+
     # ── write ────────────────────────────────────────────────────────────────
 
     def write_one(
@@ -201,23 +220,22 @@ class KVCachePool:
         layer_idx: int,
         block_tables: List[List[int]],
         seq_lens: List[int],
+        flat_indices: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Gather KV for a BATCH of sequences, padded to max(seq_lens).
 
-        Used by batched decode: all sequences in the active decode batch
-        are gathered in one call so the attention GEMM can run as a single
-        (B, heads, max_len, head_dim) operation.
+        flat_indices : pre-computed per-sequence flat pool indices
+            (from precompute_decode_indices). When provided, the O(seq_len)
+            _flat_indices computation is skipped — each layer reuses the same
+            indices since positions do not change within a step.
+            This reduces Python overhead from B×16 to B calls per step.
 
         Returns
         ───────
         k_padded : (B, num_kv_heads, max_len, head_dim)
         v_padded : (B, num_kv_heads, max_len, head_dim)
         mask     : (B, 1, 1, max_len) — 0.0 for valid, -inf for padding
-                   additive mask compatible with F.scaled_dot_product_attention
-
-        Memory overhead: B × max_len × kv_heads × head_dim × 2 bytes
-        For B=4, max_len=2048: 4×2048×8×64×2 = 8 MiB — trivial.
 
         Future (FlashInfer): replace with BatchDecodeWithPagedKVCacheWrapper
         which operates on the paged pool directly — no gather copy needed.
@@ -230,16 +248,21 @@ class KVCachePool:
             device=self.device, dtype=self.dtype,
         )
         v_out  = torch.zeros_like(k_out)
-        # Additive mask: 0 = attend, -inf = ignore
         mask = torch.full(
             (B, 1, 1, max_len), float("-inf"),
             device=self.device, dtype=torch.float32,
         )
 
-        for i, (table, slen) in enumerate(zip(block_tables, seq_lens)):
-            k_i, v_i = self.gather_kv(layer_idx, table, slen)  # (kv_heads, slen, head_dim)
-            k_out[i, :, :slen, :] = k_i
-            v_out[i, :, :slen, :] = v_i
+        for i, slen in enumerate(seq_lens):
+            idx = (
+                flat_indices[i]
+                if flat_indices is not None
+                else self._flat_indices(block_tables[i], slen)
+            )
+            k = self.k_pools[layer_idx][idx]   # (slen, kv_heads, head_dim)
+            v = self.v_pools[layer_idx][idx]
+            k_out[i, :, :slen, :] = k.permute(1, 0, 2)
+            v_out[i, :, :slen, :] = v.permute(1, 0, 2)
             mask[i, 0, 0, :slen] = 0.0
 
         return k_out, v_out, mask

@@ -252,55 +252,33 @@ class GQA(nn.Module):
         kv_cache: "KVCachePool",
         block_tables: List[List[int]],
         positions: List[int],         # num_kv_entries for each seq
+        flat_indices: Optional[List["torch.Tensor"]] = None,  # pre-computed
     ) -> torch.Tensor:                # (B, 1, hidden)
         """
         Batched decode: ONE forward pass for ALL active decode requests.
-
-        All 4 linear projections (q/k/v/o) run as single (B,1,H) GEMMs.
-        Attention uses padded KV gather + additive mask so SDPA handles
-        heterogeneous context lengths in one call.
-
-        Steps:
-          1. q,k,v = _qkv(x) — batched projection + per-seq RoPE
-          2. write_one per seq  — B scalar writes to paged pool (cheap)
-          3. gather_kv_batch   — (B, kv_heads, max_len, head_dim) + mask
-          4. GQA expand + SDPA — single batched attention call
-          5. o_proj            — single (B,1,H) GEMM
-
-        Future (FlashInfer): replace steps 3-4 with
-          flashinfer.BatchDecodeWithPagedKVCacheWrapper
-          which reads directly from the paged pool without gather.
+        flat_indices: pre-computed per-seq gather indices (reused across layers).
         """
         B = x.size(0)
         q, k, v = self._qkv(x, cos, sin)
-        # q: (B, num_heads, 1, head_dim)
-        # k: (B, num_kv,    1, head_dim)
 
-        # ── write each seq's new KV into pool ────────────────────────────────
+        # write each seq's new KV into pool
         for i in range(B):
             kv_cache.write_one(
                 self.layer_idx, block_tables[i], positions[i],
-                k[i, :, 0, :],   # (num_kv, head_dim)
+                k[i, :, 0, :],
                 v[i, :, 0, :],
             )
 
-        # ── gather full padded context for all seqs ───────────────────────────
-        seq_lens = [p + 1 for p in positions]   # tokens in cache after write
+        seq_lens = [p + 1 for p in positions]
         k_ctx, v_ctx, mask = kv_cache.gather_kv_batch(
-            self.layer_idx, block_tables, seq_lens
+            self.layer_idx, block_tables, seq_lens, flat_indices
         )
-        # k_ctx : (B, num_kv, max_len, head_dim)
-        # mask  : (B, 1, 1, max_len)  — 0 / -inf additive mask
 
-        # GQA expansion: (B, num_heads, max_len, head_dim)
         k_e = k_ctx.repeat_interleave(self.groups, dim=1)
         v_e = v_ctx.repeat_interleave(self.groups, dim=1)
-
-        # Batched SDPA — single kernel call for all B sequences
         out = F.scaled_dot_product_attention(
             q, k_e, v_e, attn_mask=mask.to(q.dtype)
-        )  # (B, num_heads, 1, head_dim)
-
+        )
         return self.o_proj(out.transpose(1, 2).contiguous().view(B, 1, -1))
 
 
@@ -370,19 +348,20 @@ class TransformerLayer(nn.Module):
 
     def forward_decode_batch(
         self,
-        x: torch.Tensor,              # (B, 1, hidden)
+        x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
         kv_cache: "KVCachePool",
         block_tables: List[List[int]],
         positions: List[int],
-    ) -> torch.Tensor:                # (B, 1, hidden)
+        flat_indices: Optional[List["torch.Tensor"]] = None,
+    ) -> torch.Tensor:
         """
         Batched decode layer: norm + batched attention + batched FFN.
-        All 7 linear ops run as (B, 1, H) GEMMs in one shot.
+        flat_indices forwarded to attention to avoid recomputing per layer.
         """
         x = x + self.self_attn.forward_decode_batch(
-            self.input_layernorm(x), cos, sin, kv_cache, block_tables, positions
+            self.input_layernorm(x), cos, sin, kv_cache, block_tables, positions, flat_indices
         )
         return self._ffn(x)
 
@@ -488,31 +467,26 @@ class LlamaModel(nn.Module):
         """
         Batched decode: one forward pass for ALL active decode requests.
 
-        Args
-        ────
-        tokens       : last generated token for each request  (length B)
-        block_tables : paged KV block table per request
-        positions    : num_kv_entries per request (= write position for new KV)
+        Pre-computes paged gather indices ONCE then reuses across all 16 layers
+        — reduces _flat_indices calls from B×16 to B per step.
 
-        Returns
-        ───────
-        logits : (B, vocab_size) — one set of logits per request
-
-        All 7 linear layers (q/k/v/o + gate/up/down) per transformer block
-        execute as a single (B, 1, hidden_size) GEMM instead of B separate
-        (1, 1, hidden_size) vector-matrix multiplications.
-        For B=4 this is ~3x faster decode throughput on a GPU.
+        Returns logits : (B, vocab_size)
         """
         B      = len(tokens)
         device = next(self.parameters()).device
 
-        ids     = torch.tensor(tokens, device=device).unsqueeze(1)     # (B, 1)
-        pos_ids = torch.tensor(positions, device=device).unsqueeze(1)  # (B, 1)
+        ids     = torch.tensor(tokens, device=device).unsqueeze(1)
+        pos_ids = torch.tensor(positions, device=device).unsqueeze(1)
 
-        h        = self.embed_tokens(ids)               # (B, 1, hidden)
-        cos, sin = self.rotary_emb(h, pos_ids)          # (B, 1, head_dim)
+        h        = self.embed_tokens(ids)
+        cos, sin = self.rotary_emb(h, pos_ids)
+
+        # Pre-compute gather indices once — same positions for every layer
+        flat_indices = kv_cache.precompute_decode_indices(block_tables, positions)
 
         for layer in self.layers:
-            h = layer.forward_decode_batch(h, cos, sin, kv_cache, block_tables, positions)
+            h = layer.forward_decode_batch(
+                h, cos, sin, kv_cache, block_tables, positions, flat_indices
+            )
 
-        return self.lm_head(self.norm(h))[:, 0, :]      # (B, vocab_size)
+        return self.lm_head(self.norm(h))[:, 0, :]

@@ -34,6 +34,8 @@ next step.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import functools
 import os
 from dataclasses import dataclass
 from typing import AsyncIterator, List, Optional
@@ -81,6 +83,12 @@ class LlamaEngine:
         self.kv_cache, self.allocator = self._init_kv_cache()
         self.scheduler = Scheduler(self.allocator, max_running=engine_cfg.max_batch_size)
 
+        # Dedicated inference thread — keeps PyTorch compute off the event loop
+        # so the event loop can concurrently handle streaming consumers and
+        # new request submissions while GPU work is in flight.
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="llama-infer"
+        )
         self._loop_task: Optional[asyncio.Task] = None
 
     # ── init helpers ─────────────────────────────────────────────────────────
@@ -165,41 +173,68 @@ class LlamaEngine:
 
     # ── one engine step ───────────────────────────────────────────────────────
 
-    async def _step(self) -> None:
-        prefill_reqs, decode_reqs = self.scheduler.schedule()
+    # ── synchronous compute (runs in thread pool) ─────────────────────────────
 
-        # ── prefill (one request at a time; future: chunked multi-req) ────────
+    def _compute_sync(
+        self,
+        prefill_reqs: List[Request],
+        decode_reqs:  List[Request],
+    ) -> List[tuple]:
+        """
+        Pure CPU/GPU computation — no asyncio, safe to run in a thread.
+
+        Returns list of (req, token_id, phase) where phase is
+        'prefill' or 'decode'. Token delivery happens back on the event loop.
+        """
+        results: List[tuple] = []
+
+        # ── prefill ───────────────────────────────────────────────────────────────
         for req in prefill_reqs:
             with torch.inference_mode():
-                logits = self.model.prefill(req.prompt_tokens, self.kv_cache, req.block_table)
-            token = self._sample(logits, req)
-            req.push_token(token)
-            req.status = RequestStatus.RUNNING
-            if self._is_done(req, token):
-                self.scheduler.finish(req)
+                logits = self.model.prefill(
+                    req.prompt_tokens, self.kv_cache, req.block_table
+                )
+            results.append((req, self._sample(logits, req), 'prefill'))
 
-        # ── decode: ONE batched forward pass for all active requests ──────────
-        # All 7 linear layers per transformer block run as a single (B,1,H)
-        # GEMM instead of B separate vector-matrix ops. ~3x decode throughput.
-        active_decode = [r for r in decode_reqs if r.status == RequestStatus.RUNNING]
-        if active_decode:
-            tokens       = [req.output_tokens[-1] for req in active_decode]
-            positions    = [req.num_kv_entries     for req in active_decode]
-            block_tables = [req.block_table        for req in active_decode]
+        # ── batched decode ───────────────────────────────────────────────────────
+        active = [r for r in decode_reqs if r.status == RequestStatus.RUNNING]
+        if active:
+            tokens       = [req.output_tokens[-1] for req in active]
+            positions    = [req.num_kv_entries     for req in active]
+            block_tables = [req.block_table        for req in active]
 
             with torch.inference_mode():
                 all_logits = self.model.decode_batch(
                     tokens, self.kv_cache, block_tables, positions
-                )  # (B, vocab_size)
+                )
 
-            for i, req in enumerate(active_decode):
-                token = self._sample(all_logits[i], req)
-                req.push_token(token)
-                if self._is_done(req, token):
-                    self.scheduler.finish(req)
+            for i, req in enumerate(active):
+                results.append((req, self._sample(all_logits[i], req), 'decode'))
 
-        # Yield to event loop so streaming consumers can read queued tokens
-        await asyncio.sleep(0)
+        return results
+
+    # ── async step (event loop: schedule → thread → dispatch) ───────────────
+
+    async def _step(self) -> None:
+        # 1. Schedule — fast list ops, safe on event loop thread
+        prefill_reqs, decode_reqs = self.scheduler.schedule()
+        if not prefill_reqs and not decode_reqs:
+            return
+
+        # 2. Compute — heavy GPU work runs in thread, event loop stays free
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            self._executor,
+            functools.partial(self._compute_sync, prefill_reqs, decode_reqs),
+        )
+
+        # 3. Dispatch tokens — back on event loop thread, queue ops are safe
+        for req, token, phase in results:
+            req.push_token(token)
+            if phase == 'prefill':
+                req.status = RequestStatus.RUNNING
+            if self._is_done(req, token):
+                self.scheduler.finish(req)
 
     # ── background loop ───────────────────────────────────────────────────────
 
