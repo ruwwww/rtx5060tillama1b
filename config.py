@@ -31,3 +31,14 @@ class EngineConfig:
     max_batch_size: int = 4
     max_seq_len: int = 2048
     device: str = 'cuda'
+
+    # torch.compile settings
+    use_torch_compile: bool = False
+    compile_mode: str = "reduce-overhead"   # or "default" / "max-autotune"
+
+    # CUDA Graph settings (Phase 4)
+    # Capture one graph per bucket; replay the smallest bucket >= actual B.
+    # Buckets empirically justified by Q3 audit: B=1,4,8,16 cover 2.5x step time range.
+    use_cuda_graphs: bool = False
+    graph_batch_buckets: tuple = (1, 4, 8, 16)   # must be sorted ascending
+

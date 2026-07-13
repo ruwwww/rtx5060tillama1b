@@ -51,6 +51,23 @@ class KVCacheBackend(ABC):
         pass
 
     @abstractmethod
+    def write_kv_indexed(
+        self,
+        layer_idx:   int,
+        blk_indices: torch.Tensor,   # (B,) int32 — block index per request
+        blk_offsets: torch.Tensor,   # (B,) int32 — offset within block
+        k:           torch.Tensor,   # (B, num_kv_heads, head_dim)
+        v:           torch.Tensor,   # (B, num_kv_heads, head_dim)
+    ) -> None:
+        """
+        Scatter-write K/V for a batch of requests using pre-computed indices.
+
+        All arguments are GPU tensors — no Python loops, no scalar indexing.
+        Capturable inside a CUDA graph.
+        """
+        pass
+
+    @abstractmethod
     def write_many(
         self,
         layer_idx: int,
@@ -249,6 +266,20 @@ class ContiguousKVBackend(KVCacheBackend):
     ) -> None:
         self.pool.write_one(layer_idx, block_table, position, k, v)
 
+
+    def write_kv_indexed(
+        self,
+        layer_idx:   int,
+        blk_indices: torch.Tensor,
+        blk_offsets: torch.Tensor,
+        k:           torch.Tensor,
+        v:           torch.Tensor,
+    ) -> None:
+        raise NotImplementedError(
+            "write_kv_indexed requires PagedKVBackend (4D layout). "
+            "CUDA graph path is only compatible with PagedKVBackend."
+        )
+
     def write_many(
         self,
         layer_idx: int,
@@ -390,6 +421,26 @@ class PagedKVBackend(KVCacheBackend):
         offset = position % self.block_size
         self.k_pools[layer_idx][block_idx, offset] = k
         self.v_pools[layer_idx][block_idx, offset] = v
+
+    def write_kv_indexed(
+        self,
+        layer_idx:   int,
+        blk_indices: torch.Tensor,   # (B,) int32
+        blk_offsets: torch.Tensor,   # (B,) int32
+        k:           torch.Tensor,   # (B, num_kv_heads, head_dim)
+        v:           torch.Tensor,   # (B, num_kv_heads, head_dim)
+    ) -> None:
+        """
+        Scatter-write K/V for an entire batch in a single tensor op.
+
+        k_pools[layer_idx][blk_indices[i], blk_offsets[i]] = k[i]
+
+        This is fully capturable in a CUDA graph because:
+          • blk_indices and blk_offsets are pre-allocated tensors (stable addr)
+          • The assignment is a single scatter kernel (no Python loops)
+        """
+        self.k_pools[layer_idx][blk_indices, blk_offsets] = k
+        self.v_pools[layer_idx][blk_indices, blk_offsets] = v
 
     def write_many(
         self,
