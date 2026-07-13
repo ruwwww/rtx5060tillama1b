@@ -1,7 +1,10 @@
 import argparse
 import asyncio
 import json
-from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
@@ -19,7 +22,14 @@ class ChatRequest(BaseModel):
 
 
 def create_app(engine: LlamaEngine) -> FastAPI:
-    app = FastAPI(title="RTX 5060 Ti Llama 1B Server")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        await engine.start()
+        yield
+        await engine.stop()
+
+    app = FastAPI(title="RTX 5060 Ti Llama 1B Server", lifespan=lifespan)
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -423,7 +433,7 @@ def create_app(engine: LlamaEngine) -> FastAPI:
                 max_new_tokens=req.max_tokens,
                 temperature=req.temperature,
                 top_p=req.top_p,
-                top_k=req.top_k
+                top_k=req.top_k,
             ):
                 yield f"data: {json.dumps({'text': chunk.text, 'finished': chunk.finished})}\n\n"
         return StreamingResponse(event_generator(), media_type="text/event-stream")

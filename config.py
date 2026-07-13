@@ -28,6 +28,6 @@ class ModelConfig:
 
 @dataclass
 class EngineConfig:
-    max_batch_size: int = 32
-    max_seq_len: int = 8192
+    max_batch_size: int = 4
+    max_seq_len: int = 2048
     device: str = 'cuda'
