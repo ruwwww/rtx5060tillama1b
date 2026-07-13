@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import ModelConfig
+from core.attention import AttentionBackend, PyTorchAttention
 
 if TYPE_CHECKING:
     from core.kv_cache import KVCacheBackend
@@ -117,13 +118,14 @@ class RotaryEmbedding(nn.Module):
 # ── Grouped-Query Attention ───────────────────────────────────────────────────
 
 class GQA(nn.Module):
-    def __init__(self, model_cfg: ModelConfig, layer_idx: int) -> None:
+    def __init__(self, model_cfg: ModelConfig, layer_idx: int, attn_backend: AttentionBackend) -> None:
         super().__init__()
         self.layer_idx  = layer_idx
         self.num_heads  = model_cfg.num_attention_heads
         self.num_kv     = model_cfg.num_key_value_heads
         self.head_dim   = model_cfg.head_dim
         self.groups     = self.num_heads // self.num_kv
+        self.attn_backend = attn_backend
         H  = model_cfg.hidden_size
         Hq = self.num_heads * self.head_dim
         Hk = self.num_kv   * self.head_dim
@@ -178,25 +180,13 @@ class GQA(nn.Module):
         block_table: List[int],
     ) -> torch.Tensor:
         """
-        Causal SDPA over full prompt then scatter-write KV into the pool.
-
-        Future (FlashInfer): fused prefill kernel writes KV while computing
-        attention — replace this method body with one kernel call.
+        Delegates prefill attention computation to AttentionBackend.
         """
         _, S, _ = x.shape
         q, k, v = self._qkv(x, cos, sin)
-        # k,v: (1, num_kv, S, head_dim)
-
-        # ── write KV to pool ─────────────────────────────────────────────────
-        # k_write: (S, num_kv, head_dim)
-        k_write = k.squeeze(0).permute(1, 0, 2).contiguous()
-        v_write = v.squeeze(0).permute(1, 0, 2).contiguous()
-        kv_cache.write_many(self.layer_idx, block_table, k_write, v_write, start_pos=0)
-
-        # ── causal attention ─────────────────────────────────────────────────
-        k_e = k.repeat_interleave(self.groups, dim=1)
-        v_e = v.repeat_interleave(self.groups, dim=1)
-        out = F.scaled_dot_product_attention(q, k_e, v_e, is_causal=True)
+        out = self.attn_backend.forward_prefill(
+            q, k, v, self.layer_idx, kv_cache, block_table, self.groups
+        )
         return self.o_proj(out.transpose(1, 2).contiguous().view(1, S, -1))
 
     # ── decode path ───────────────────────────────────────────────────────────
@@ -255,29 +245,12 @@ class GQA(nn.Module):
         flat_indices: Optional[List["torch.Tensor"]] = None,  # pre-computed
     ) -> torch.Tensor:                # (B, 1, hidden)
         """
-        Batched decode: ONE forward pass for ALL active decode requests.
-        flat_indices: pre-computed per-seq gather indices (reused across layers).
+        Delegates batched decode attention to AttentionBackend.
         """
         B = x.size(0)
         q, k, v = self._qkv(x, cos, sin)
-
-        # write each seq's new KV into pool
-        for i in range(B):
-            kv_cache.write_one(
-                self.layer_idx, block_tables[i], positions[i],
-                k[i, :, 0, :],
-                v[i, :, 0, :],
-            )
-
-        seq_lens = [p + 1 for p in positions]
-        k_ctx, v_ctx, mask = kv_cache.gather_kv_batch(
-            self.layer_idx, block_tables, seq_lens, flat_indices
-        )
-
-        k_e = k_ctx.repeat_interleave(self.groups, dim=1)
-        v_e = v_ctx.repeat_interleave(self.groups, dim=1)
-        out = F.scaled_dot_product_attention(
-            q, k_e, v_e, attn_mask=mask.to(q.dtype)
+        out = self.attn_backend.forward_decode_batch(
+            q, k, v, self.layer_idx, kv_cache, block_tables, positions, flat_indices, self.groups
         )
         return self.o_proj(out.transpose(1, 2).contiguous().view(B, 1, -1))
 
@@ -298,10 +271,10 @@ class SwiGLUFFN(nn.Module):
 # ── Transformer Layer ─────────────────────────────────────────────────────────
 
 class TransformerLayer(nn.Module):
-    def __init__(self, model_cfg: ModelConfig, layer_idx: int) -> None:
+    def __init__(self, model_cfg: ModelConfig, layer_idx: int, attn_backend: AttentionBackend) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.self_attn  = GQA(model_cfg, layer_idx)
+        self.self_attn  = GQA(model_cfg, layer_idx, attn_backend)
         self.mlp        = SwiGLUFFN(model_cfg)
         self.input_layernorm          = RMSNorm(model_cfg.hidden_size, model_cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(model_cfg.hidden_size, model_cfg.rms_norm_eps)
@@ -369,11 +342,15 @@ class TransformerLayer(nn.Module):
 # ── Llama Model ───────────────────────────────────────────────────────────────
 
 class LlamaModel(nn.Module):
-    def __init__(self, model_cfg: ModelConfig) -> None:
+    def __init__(self, model_cfg: ModelConfig, attn_backend: Optional[AttentionBackend] = None) -> None:
         super().__init__()
+        self.attn_backend = attn_backend or PyTorchAttention()
         self.embed_tokens = nn.Embedding(model_cfg.vocab_size, model_cfg.hidden_size)
         self.layers       = nn.ModuleList(
-            [TransformerLayer(model_cfg, i) for i in range(model_cfg.num_hidden_layers)]
+            [
+                TransformerLayer(model_cfg, i, self.attn_backend)
+                for i in range(model_cfg.num_hidden_layers)
+            ]
         )
         self.norm       = RMSNorm(model_cfg.hidden_size, model_cfg.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(model_cfg)
