@@ -221,6 +221,9 @@ class LlamaEngine:
             * self.model_cfg.head_dim * 2  # bfloat16
         ) / 1024**3
         print(f"[engine] KV cache  : {num_blocks} blocks × {self.BLOCK_SIZE} tokens = {total_tokens} slots  ({kv_gb:.2f} GiB)")
+        # Allocate 1 dummy block for graph padding that is never freed/re-allocated
+        self.dummy_block_id = backend.alloc(1)[0]
+        print(f"[engine] allocated dummy block index {self.dummy_block_id} for graph padding")
         return backend
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
@@ -382,6 +385,14 @@ class LlamaEngine:
                 if self.graph_manager is not None:
                     bucket_size = self.graph_manager.select_bucket(B)
                     if bucket_size is not None:
+                        # Pad the unused batch slots in the pre-allocated buffers up to bucket_size
+                        # to prevent writing garbage KV keys/values to active blocks.
+                        if bucket_size > B:
+                            self._ids_buf[B:bucket_size, 0] = self.tokenizer.eos_token_id
+                            self._pos_buf[B:bucket_size, 0] = 0
+                            self._blk_indices_buf[B:bucket_size] = self.dummy_block_id
+                            self._blk_offsets_buf[B:bucket_size] = 0
+                        
                         # Slice of the static input buffers that correspond to the full bucket size
                         ids_bucket       = self._ids_buf[:bucket_size]
                         pos_bucket       = self._pos_buf[:bucket_size]
