@@ -13,12 +13,20 @@ from config import EngineConfig, ModelConfig
 from engine import LlamaEngine
 
 
+from typing import AsyncIterator, List, Optional
+
+class Message(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
-    prompt: str
+    prompt: Optional[str] = None
+    messages: Optional[List[Message]] = None
     max_tokens: int = 128
     temperature: float = 0.8
     top_p: float = 0.95
     top_k: int = 40
+
 
 
 def create_app(engine: LlamaEngine) -> FastAPI:
@@ -352,6 +360,9 @@ def create_app(engine: LlamaEngine) -> FastAPI:
                 const promptInput = document.getElementById('prompt-input');
                 const sendBtn = document.getElementById('send-btn');
 
+                // Client-side history storage for Llama 3.2 Instruct multi-turn support
+                const conversationHistory = [];
+
                 async function sendMessage() {
                     const prompt = promptInput.value.trim();
                     if (!prompt) return;
@@ -364,6 +375,9 @@ def create_app(engine: LlamaEngine) -> FastAPI:
                     userMsg.innerHTML = `<div class="message-bubble">${prompt}</div><div class="message-meta">User</div>`;
                     messagesContainer.appendChild(userMsg);
                     messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+                    // Append user message to history
+                    conversationHistory.push({ role: 'user', content: prompt });
 
                     // Add assistant temporary message
                     const assistantMsg = document.createElement('div');
@@ -380,7 +394,7 @@ def create_app(engine: LlamaEngine) -> FastAPI:
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            prompt: prompt,
+                            messages: conversationHistory,
                             temperature: parseFloat(document.getElementById('temp').value),
                             top_p: parseFloat(document.getElementById('top_p').value),
                             max_tokens: parseInt(document.getElementById('max_tokens').value)
@@ -410,7 +424,11 @@ def create_app(engine: LlamaEngine) -> FastAPI:
                             }
                         }
                     }
+
+                    // Append assistant reply to history for subsequent turns
+                    conversationHistory.push({ role: 'assistant', content: bubbleRef.textContent });
                 }
+
 
                 sendBtn.addEventListener('click', sendMessage);
                 promptInput.addEventListener('keydown', (e) => {
@@ -427,12 +445,24 @@ def create_app(engine: LlamaEngine) -> FastAPI:
 
     @app.post("/v1/chat")
     async def chat(req: ChatRequest):
-        # Wrap raw user prompt in standard Llama 3.2 Instruct chat template format
-        # to ensure correct instruction-following behavior and clear outputs.
-        formatted_prompt = (
-            f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n"
-            f"{req.prompt.strip()}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
-        )
+        if req.messages:
+            # Build Llama 3.2 Instruct multi-turn prompt from history
+            prompt_parts = ["<|begin_of_text|>"]
+            for msg in req.messages:
+                prompt_parts.append(
+                    f"<|start_header_id|>{msg.role.strip()}<|end_header_id|>\n"
+                    f"{msg.content.strip()}<|eot_id|>"
+                )
+            # End with assistant turn header so the model completes it
+            prompt_parts.append("<|start_header_id|>assistant<|end_header_id|>\n")
+            formatted_prompt = "".join(prompt_parts)
+        else:
+            # Legacy one-shot prompt fallback
+            raw_p = req.prompt.strip() if req.prompt else ""
+            formatted_prompt = (
+                f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n"
+                f"{raw_p}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+            )
         
         async def event_generator():
             async for chunk in engine.generate(
@@ -444,6 +474,7 @@ def create_app(engine: LlamaEngine) -> FastAPI:
             ):
                 yield f"data: {json.dumps({'text': chunk.text, 'finished': chunk.finished})}\n\n"
         return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
     return app
 
