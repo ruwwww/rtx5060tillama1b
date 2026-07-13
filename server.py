@@ -427,9 +427,16 @@ def create_app(engine: LlamaEngine) -> FastAPI:
 
     @app.post("/v1/chat")
     async def chat(req: ChatRequest):
+        # Wrap raw user prompt in standard Llama 3.2 Instruct chat template format
+        # to ensure correct instruction-following behavior and clear outputs.
+        formatted_prompt = (
+            f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n"
+            f"{req.prompt.strip()}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+        )
+        
         async def event_generator():
             async for chunk in engine.generate(
-                prompt=req.prompt,
+                prompt=formatted_prompt,
                 max_new_tokens=req.max_tokens,
                 temperature=req.temperature,
                 top_p=req.top_p,
@@ -439,6 +446,7 @@ def create_app(engine: LlamaEngine) -> FastAPI:
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     return app
+
 
 
 def main():
