@@ -1,0 +1,17 @@
+[project]
+name = "rtx5060tillama1b"
+version = "0.1.0"
+description = "A minimalistic HuggingFace safetensors Llama 1B inference engine and server."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "transformers",
+    "safetensors",
+    "fastapi",
+    "uvicorn"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
