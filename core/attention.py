@@ -17,6 +17,15 @@ if TYPE_CHECKING:
     from core.kv_cache import KVCacheBackend
 
 
+from dataclasses import dataclass
+
+@dataclass
+class FlashInferMetadata:
+    block_table: torch.Tensor       # (B, max_blocks_per_seq)
+    seq_lens: torch.Tensor          # (B,)
+    block_size: int
+
+
 class AttentionBackend(ABC):
     """
     Abstract interface for executing attention.
@@ -39,7 +48,7 @@ class AttentionBackend(ABC):
     def forward_decode_batch(
         self,
         q: torch.Tensor,                # (B, num_heads, 1, head_dim)
-        k: torch.Tensor,                # (B, num_kv_heads, 1, head_dim) - current token's projected KV
+        k: torch.Tensor,                # (B, num_kv_heads, 1, head_dim)
         v: torch.Tensor,                # (B, num_kv_heads, 1, head_dim)
         layer_idx: int,
         kv_backend: KVCacheBackend,
@@ -47,6 +56,7 @@ class AttentionBackend(ABC):
         positions: List[int],
         flat_indices: Optional[List[torch.Tensor]],
         groups: int,
+        metadata: FlashInferMetadata,
     ) -> torch.Tensor:                  # (B, num_heads, 1, head_dim)
         pass
 
@@ -90,6 +100,7 @@ class PyTorchAttention(AttentionBackend):
         positions: List[int],
         flat_indices: Optional[List[torch.Tensor]],
         groups: int,
+        metadata: FlashInferMetadata,
     ) -> torch.Tensor:
         B = q.size(0)
 

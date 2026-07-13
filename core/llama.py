@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import ModelConfig
-from core.attention import AttentionBackend, PyTorchAttention
+from core.attention import AttentionBackend, PyTorchAttention, FlashInferMetadata
 
 if TYPE_CHECKING:
     from core.kv_cache import KVCacheBackend
@@ -243,6 +243,7 @@ class GQA(nn.Module):
         block_tables: List[List[int]],
         positions: List[int],         # num_kv_entries for each seq
         flat_indices: Optional[List["torch.Tensor"]] = None,  # pre-computed
+        metadata: Optional[FlashInferMetadata] = None,
     ) -> torch.Tensor:                # (B, 1, hidden)
         """
         Delegates batched decode attention to AttentionBackend.
@@ -250,7 +251,7 @@ class GQA(nn.Module):
         B = x.size(0)
         q, k, v = self._qkv(x, cos, sin)
         out = self.attn_backend.forward_decode_batch(
-            q, k, v, self.layer_idx, kv_cache, block_tables, positions, flat_indices, self.groups
+            q, k, v, self.layer_idx, kv_cache, block_tables, positions, flat_indices, self.groups, metadata
         )
         return self.o_proj(out.transpose(1, 2).contiguous().view(B, 1, -1))
 
@@ -328,13 +329,14 @@ class TransformerLayer(nn.Module):
         block_tables: List[List[int]],
         positions: List[int],
         flat_indices: Optional[List["torch.Tensor"]] = None,
+        metadata: Optional[FlashInferMetadata] = None,
     ) -> torch.Tensor:
         """
         Batched decode layer: norm + batched attention + batched FFN.
         flat_indices forwarded to attention to avoid recomputing per layer.
         """
         x = x + self.self_attn.forward_decode_batch(
-            self.input_layernorm(x), cos, sin, kv_cache, block_tables, positions, flat_indices
+            self.input_layernorm(x), cos, sin, kv_cache, block_tables, positions, flat_indices, metadata
         )
         return self._ffn(x)
 
@@ -461,9 +463,21 @@ class LlamaModel(nn.Module):
         # Pre-compute gather indices once — same positions for every layer
         flat_indices = kv_cache.precompute_decode_indices(block_tables, positions)
 
+        # Populate FlashInfer-compatible metadata structure
+        max_blocks = max(len(table) for table in block_tables)
+        padded_tables = [table + [-1] * (max_blocks - len(table)) for table in block_tables]
+        block_table_tensor = torch.tensor(padded_tables, device=device, dtype=torch.int32)
+        seq_lens_tensor = torch.tensor([p + 1 for p in positions], device=device, dtype=torch.int32)
+
+        metadata = FlashInferMetadata(
+            block_table=block_table_tensor,
+            seq_lens=seq_lens_tensor,
+            block_size=16  # fixed block size
+        )
+
         for layer in self.layers:
             h = layer.forward_decode_batch(
-                h, cos, sin, kv_cache, block_tables, positions, flat_indices
+                h, cos, sin, kv_cache, block_tables, positions, flat_indices, metadata
             )
 
         return self.lm_head(self.norm(h))[:, 0, :]
